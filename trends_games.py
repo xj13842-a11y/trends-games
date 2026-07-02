@@ -10,6 +10,22 @@ from typing import Optional
 from xml.etree import ElementTree as ET
 
 import requests
+
+# Monkey-patch for pytrends compatibility with urllib3 >= 2.0
+import urllib3.util.retry as _retry_mod
+
+_OriginalRetry = _retry_mod.Retry
+
+
+class _PatchedRetry(_OriginalRetry):
+    def __init__(self, *args, method_whitelist=None, **kwargs):
+        if method_whitelist is not None:
+            kwargs.setdefault("allowed_methods", method_whitelist)
+        super().__init__(*args, **kwargs)
+
+
+_retry_mod.Retry = _PatchedRetry
+
 from pytrends.request import TrendReq
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
