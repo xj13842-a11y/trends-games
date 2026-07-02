@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Google Trends gaming/meme trend monitor with Feishu notifications."""
+"""Google Trends gaming/meme trend monitor — multi-region with Feishu notifications."""
 
 import json
 import os
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from xml.etree import ElementTree as ET
@@ -30,26 +29,58 @@ from pytrends.request import TrendReq
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK", "")
-GEO = os.environ.get("GEO", "US")
-HL = os.environ.get("HL", "en-US")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
-TRENDS_RSS_URL = f"https://trends.google.com/trending/rss?geo={GEO}"
 SEEN_TERMS_FILE = "seen_terms.json"
 
+REGIONS = ["US", "MX", "BR", "JP", "KR", "GB"]
+REGION_EMOJI = {
+    "US": "🇺🇸",
+    "MX": "🇲🇽",
+    "BR": "🇧🇷",
+    "JP": "🇯🇵",
+    "KR": "🇰🇷",
+    "GB": "🇬🇧",
+}
+REGION_NAME = {
+    "US": "美国",
+    "MX": "墨西哥",
+    "BR": "巴西",
+    "JP": "日本",
+    "KR": "韩国",
+    "GB": "英国",
+}
+
 TARGET_CATEGORIES = {"game", "game_meme", "meme"}
+CATEGORY_PRIORITY = {"game_meme": 0, "game": 1, "meme": 2}
+CATEGORY_EMOJI = {"game_meme": "🔥", "game": "🎮", "meme": "🤣"}
 
-CATEGORY_EMOJI = {"game": "🎮", "game_meme": "🔥", "meme": "🤣"}
-CATEGORY_LABEL = {"game": "Game", "game_meme": "Game+Meme", "meme": "Meme"}
+TOPIC_EMOJI = {
+    "财经": "📈",
+    "体育": "⚽",
+    "影视": "🎬",
+    "科技": "💻",
+    "娱乐": "🎭",
+    "政治": "🏛️",
+    "社会": "📰",
+    "人物": "👤",
+    "游戏": "🎮",
+    "游戏+梗": "🔥",
+    "流行梗": "🤣",
+    "健康": "🏥",
+    "教育": "📚",
+    "天气": "🌤️",
+    "美食": "🍽️",
+}
 
 
-def fetch_rss_trends() -> list[dict]:
-    resp = requests.get(TRENDS_RSS_URL, timeout=30)
+def fetch_rss_trends(geo: str) -> tuple[str, list[dict]]:
+    url = f"https://trends.google.com/trending/rss?geo={geo}"
+    resp = requests.get(url, timeout=30)
     resp.raise_for_status()
 
     root = ET.fromstring(resp.content)
     ns = {"ht": "https://trends.google.com/trending/rss"}
 
-    # Extract the RSS publication date to identify batch freshness
     channel_pub = root.findtext(".//pubDate", "")
     batch_date = _parse_rss_date(channel_pub)
 
@@ -57,21 +88,19 @@ def fetch_rss_trends() -> list[dict]:
     for item in root.findall(".//item"):
         title_el = item.find("title")
         title = title_el.text.strip() if title_el is not None and title_el.text else ""
+        if not title:
+            continue
 
         traffic_el = item.find("ht:approx_traffic", ns)
         traffic = (
             traffic_el.text.strip()
             if traffic_el is not None and traffic_el.text
-            else "unknown"
+            else "?"
         )
 
-        pub_el = item.find("pubDate")
-        pub_raw = pub_el.text.strip() if pub_el is not None and pub_el.text else ""
-
         news_items = item.findall("ht:news_item", ns)
-        news_titles = []
-        news_sources = []
-        for ni in news_items[:5]:
+        news_titles, news_sources = [], []
+        for ni in news_items[:3]:
             nit = ni.find("ht:news_item_title", ns)
             if nit is not None and nit.text:
                 news_titles.append(nit.text.strip())
@@ -79,22 +108,18 @@ def fetch_rss_trends() -> list[dict]:
             if nis is not None and nis.text:
                 news_sources.append(nis.text.strip())
 
-        if not title:
-            continue
-
         trends.append(
             {
                 "title": title,
                 "traffic": traffic,
-                "pub_date": pub_raw,
+                "regions": [geo],
                 "batch_date": batch_date.isoformat() if batch_date else "",
                 "news_titles": news_titles,
                 "news_sources": news_sources,
-                "source": "rss",
             }
         )
 
-    return trends
+    return geo, trends
 
 
 def _parse_rss_date(raw: str) -> Optional[datetime]:
@@ -106,61 +131,31 @@ def _parse_rss_date(raw: str) -> Optional[datetime]:
         return None
 
 
-def fetch_pytrends_realtime() -> list[dict]:
-    try:
-        pytrends = TrendReq(hl=HL, tz=0, timeout=(10, 25), retries=1)
-        df = pytrends.realtime_trending_searches(pn=GEO)
-    except Exception as e:
-        print(f"  pytrends request failed: {e}")
-        return []
-
-    if df is None or df.empty:
-        return []
-
-    trends = []
-    now = datetime.now(timezone.utc).isoformat()
-    for _, row in df.iterrows():
-        title = str(row.get("title", "")).strip()
-        if not title:
-            continue
-        # Some versions return entityNames or related fields
-        related = ""
-        entity_col = row.get("entityNames", "")
-        if entity_col and hasattr(entity_col, "__iter__") and len(entity_col) > 0:
-            related = str(entity_col[0])
-        trends.append(
-            {
-                "title": title,
-                "traffic": "trending",
-                "pub_date": now,
-                "batch_date": now,
-                "news_titles": [related] if related else [],
-                "news_sources": [],
-                "source": "pytrends",
-            }
-        )
-
-    return trends
+def fetch_all_regions() -> list[dict]:
+    all_trends: list[dict] = []
+    for geo, trends in map(fetch_rss_trends, REGIONS):
+        print(f"    {geo}: {len(trends)} trends")
+        all_trends.extend(trends)
+    return all_trends
 
 
-def merge_trends(rss: list[dict], pt: list[dict]) -> list[dict]:
-    """Merge RSS and pytrends results, deduplicating by normalized title."""
-    seen = {}
-    for t in rss + pt:
+def merge_cross_region(trends: list[dict]) -> list[dict]:
+    seen: dict[str, dict] = {}
+    for t in trends:
         key = t["title"].lower().strip()
         if key in seen:
-            existing = seen[key]
-            # Merge news sources
-            existing["news_titles"] = list(
-                set(existing.get("news_titles", []) + t.get("news_titles", []))
+            ex = seen[key]
+            ex["regions"] = list(set(ex.get("regions", []) + t.get("regions", [])))
+            ex["news_titles"] = list(
+                set(ex.get("news_titles", []) + t.get("news_titles", []))
             )
-            existing["news_sources"] = list(
-                set(existing.get("news_sources", []) + t.get("news_sources", []))
+            ex["news_sources"] = list(
+                set(ex.get("news_sources", []) + t.get("news_sources", []))
             )
-            existing["source"] = f"{existing['source']}+{t['source']}"
-            # RSS traffic beats pytrends' "trending" placeholder
-            if existing.get("traffic") == "trending":
-                existing["traffic"] = t.get("traffic", "trending")
+            if _traffic_to_num(ex.get("traffic", "0")) < _traffic_to_num(
+                t.get("traffic", "0")
+            ):
+                ex["traffic"] = t["traffic"]
         else:
             seen[key] = dict(t)
     return list(seen.values())
@@ -168,38 +163,47 @@ def merge_trends(rss: list[dict], pt: list[dict]) -> list[dict]:
 
 def classify_with_deepseek(trends: list[dict]) -> list[dict]:
     if not DEEPSEEK_API_KEY:
-        print("  DEEPSEEK_API_KEY not set, skipping classification")
         for t in trends:
             t["category"] = "unknown"
+            t["topic"] = "未知"
             t["reason"] = ""
         return trends
 
     if not trends:
         return trends
 
-    # Build the prompt
     term_lines = []
     for i, t in enumerate(trends):
-        context_parts = []
+        ctx = []
         if t.get("news_titles"):
-            context_parts.extend(t["news_titles"][:3])
+            ctx.extend(t["news_titles"][:2])
         if t.get("news_sources"):
-            context_parts.extend(t["news_sources"][:2])
-        ctx = " | ".join(context_parts) if context_parts else "no context"
-        term_lines.append(f'{i + 1}. "{t["title"]}" | ctx: {ctx}')
+            ctx.extend(t["news_sources"][:1])
+        ctx_str = " | ".join(ctx) if ctx else "no context"
+        regions_str = ",".join(t.get("regions", []))
+        term_lines.append(
+            f'{i + 1}. "{t["title"]}" [regions: {regions_str}] ctx: {ctx_str}'
+        )
 
     prompt = """Classify each trending search term. Return a JSON object with a "results" array.
+Each result: {"index": N, "category": "...", "topic": "...", "reason": "..."}
 
 Categories:
-- "game_meme": a viral internet meme that ALSO has a playable game version (examples: sprunki, crazy cattle 3d, italian brainrot, skibidi toilet game). These are INTERACTIVE games born from memes.
-- "game": a known video game title, game franchise, mobile game, or game platform (examples: Fortnite, Minecraft, Elden Ring, Roblox, Steam). NOT just a gaming news topic.
-- "meme": internet meme or viral trend that does NOT have a playable game (examples: a catchphrase, a reaction image, a social media challenge without a game).
-- "other": not game or meme related. Normal news, celebrity, sports, politics, etc.
+- "game_meme": viral internet meme that also has a playable game (e.g. sprunki, crazy cattle 3d, italian brainrot)
+- "game": a video game title, franchise, or gaming platform (e.g. Fortnite, Minecraft, Elden Ring, Roblox)
+- "meme": internet meme/viral trend without a playable game
+- "other": anything else (news, celebrity, sports, politics, finance, etc.)
 
-Key judgment: "game_meme" means someone could BUILD a simple web game for this keyword and get SEO traffic. It's a meme that has or could have a game version.
+"topic" field — short Chinese category label:
+- For "game_meme": "游戏+梗"
+- For "game": "游戏"
+- For "meme": "流行梗"
+- For "other": choose from 财经/体育/影视/科技/娱乐/政治/社会/人物/健康/教育/天气/美食 or a fitting single-word Chinese label
+
+"reason" field — 1-sentence explanation in Chinese.
 
 Return ONLY valid JSON:
-{"results": [{"index": 1, "category": "game_meme", "reason": "brief reason in Chinese"}, ...]}
+{"results": [{"index": 1, "category": "other", "topic": "财经", "reason": "特斯拉股价相关"}, ...]}
 
 Terms:
 """ + "\n".join(term_lines)
@@ -213,32 +217,31 @@ Terms:
         "messages": [
             {
                 "role": "system",
-                "content": "You are a content classifier. Always output valid JSON only, no markdown.",
+                "content": "You are a content classifier. Output valid JSON only, no markdown.",
             },
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.1,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
     }
 
     try:
         resp = requests.post(
-            DEEPSEEK_API_URL, headers=headers, json=payload, timeout=90
+            DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120
         )
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f"  DeepSeek API error: {e}")
         for t in trends:
             t["category"] = "unknown"
+            t["topic"] = "未知"
             t["reason"] = ""
         return trends
 
     data = resp.json()
     content = data["choices"][0]["message"]["content"].strip()
 
-    # Parse response
     try:
-        # Strip markdown code fences if present
         if content.startswith("```"):
             lines = content.split("\n")
             content = "\n".join(
@@ -249,10 +252,10 @@ Terms:
         print(f"  Failed to parse DeepSeek JSON. Raw: {content[:500]}")
         for t in trends:
             t["category"] = "unknown"
+            t["topic"] = "未知"
             t["reason"] = ""
         return trends
 
-    # Normalize the parsed structure
     results_list = parsed if isinstance(parsed, list) else parsed.get("results", [])
     if not results_list and isinstance(parsed, list):
         results_list = parsed
@@ -266,9 +269,11 @@ Terms:
     for i, t in enumerate(trends):
         if i in class_map:
             t["category"] = class_map[i].get("category", "other")
+            t["topic"] = class_map[i].get("topic", "其他")
             t["reason"] = class_map[i].get("reason", "")
         else:
             t["category"] = "other"
+            t["topic"] = "其他"
             t["reason"] = ""
 
     tokens = data.get("usage", {}).get("total_tokens", "?")
@@ -299,7 +304,6 @@ def save_seen_terms(trends: list[dict]):
         key = t["title"].lower().strip()
         existing[key] = now
 
-    # Prune old entries (>7 days)
     cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     existing = {k: v for k, v in existing.items() if v > cutoff}
 
@@ -312,72 +316,139 @@ def send_to_feishu(trends: list[dict], dry_run: bool = False) -> bool:
         print("  FEISHU_WEBHOOK not set, skipping notification")
         return True
 
-    matched = [t for t in trends if t.get("category") in TARGET_CATEGORIES]
-
-    if not matched:
-        print("  No game/meme trends to send")
-        return True
+    # Split into high-priority (game/meme) and the rest
+    highlights = [t for t in trends if t.get("category") in TARGET_CATEGORIES]
+    others = [t for t in trends if t.get("category") not in TARGET_CATEGORIES]
 
     if dry_run:
-        print(f"  [DRY RUN] Would send {len(matched)} items:")
-        for t in matched:
-            print(f"    [{t.get('category')}] {t['title']} ({t.get('traffic')})")
+        print(
+            f"  [DRY RUN] Would send {len(highlights)} highlights + {len(others)} others"
+        )
+        for t in highlights:
+            print(
+                f"    [{t.get('category')}] {t['title']} ({t.get('traffic')}) [{t.get('topic')}]"
+            )
+        for t in others[:5]:
+            print(f"    [{t.get('topic')}] {t['title']} ({t.get('traffic')})")
+        if len(others) > 5:
+            print(f"    ... and {len(others) - 5} more")
         return True
 
-    # Sort: game_meme first, then game, then meme
-    priority = {"game_meme": 0, "game": 1, "meme": 2}
-    ordered = sorted(
-        matched,
+    elements: list[dict] = []
+
+    # --- Highlights section ---
+    if highlights:
+        elements.append(
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"**🎮 游戏 / Meme 热点 ({len(highlights)}条)**",
+                },
+            }
+        )
+
+        ordered = sorted(
+            highlights,
+            key=lambda x: (
+                CATEGORY_PRIORITY.get(x.get("category", "other"), 99),
+                -_traffic_to_num(x.get("traffic", "0")),
+            ),
+        )
+        for t in ordered:
+            emoji = CATEGORY_EMOJI.get(t.get("category", ""), "")
+            topic = t.get("topic", "")
+            region_flags = "".join(
+                str(REGION_EMOJI.get(r, r)) for r in t.get("regions", [])
+            )
+            reason_line = f"\n  {t['reason']}" if t.get("reason") else ""
+            elements.append(
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"{emoji} **{t['title']}**  `{t.get('traffic', '?')}`   {topic}  {region_flags}{reason_line}",
+                    },
+                }
+            )
+
+        elements.append({"tag": "hr"})
+
+    # --- All trends section ---
+    total = len(trends)
+    region_counts = {r: 0 for r in REGIONS}
+    for t in trends:
+        for r in t.get("regions", []):
+            if r in region_counts:
+                region_counts[r] += 1
+    region_summary = " · ".join(
+        f"{REGION_EMOJI.get(r, r)} {region_counts[r]}" for r in REGIONS
+    )
+
+    elements.append(
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"**📋 全部热搜 ({total}条)**  {region_summary}",
+            },
+        }
+    )
+
+    # Sort: highlights first, then by traffic > regions count
+    all_ordered = sorted(
+        trends,
         key=lambda x: (
-            priority.get(x.get("category", "other"), 99),
+            CATEGORY_PRIORITY.get(x.get("category", "other"), 99),
             -_traffic_to_num(x.get("traffic", "0")),
+            -len(x.get("regions", [])),
         ),
     )
 
-    elements: list[dict] = []
-    for t in ordered:
-        emoji = CATEGORY_EMOJI.get(t.get("category", ""), "")
-        label = CATEGORY_LABEL.get(t.get("category", ""), "")
+    for t in all_ordered:
+        cat = t.get("category", "other")
+        if cat in CATEGORY_EMOJI:
+            emoji = CATEGORY_EMOJI[cat]
+        else:
+            topic = t.get("topic", "")
+            emoji = TOPIC_EMOJI.get(topic, "📌")
 
-        # Build a compact info line
-        reason_line = ""
-        if t.get("reason"):
-            reason_line = f"\n{t['reason']}"
-
-        sources_line = ""
-        if t.get("news_sources"):
-            unique_sources = list(dict.fromkeys(t["news_sources"]))[:3]
-            sources_line = " | " + " · ".join(unique_sources)
+        topic = t.get("topic", "")
+        region_flags = "".join(
+            str(REGION_EMOJI.get(r, r)) for r in t.get("regions", [])
+        )
 
         elements.append(
             {
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": f"{emoji} **{t['title']}** `{t.get('traffic', '?')}` {label}{reason_line}{sources_line}",
+                    "content": f"{emoji} **{t['title']}**  `{t.get('traffic', '?')}`  {topic}  {region_flags}",
                 },
             }
         )
 
+    # --- Footer ---
     now_str = datetime.now().strftime("%m-%d %H:%M")
+    hit_count = len(highlights)
+    title = f"🌍 全球热搜 | {now_str}"
+    if hit_count > 0:
+        title += f" (🎮 {hit_count}条)"
 
     payload = {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {
-                "title": {
-                    "tag": "plain_text",
-                    "content": f"🔥 游戏/Meme 热搜 | {now_str} ({len(matched)}条)",
-                },
-                "template": "turquoise",
+                "title": {"tag": "plain_text", "content": title},
+                "template": "blue",
             },
             "elements": elements,
             "note": {
                 "elements": [
                     {
                         "tag": "plain_text",
-                        "content": f"Geo: {GEO} | Google Trends · RSS + pytrends",
+                        "content": f"Google Trends RSS · DeepSeek 分类 · {len(REGIONS)}个地区",
                     }
                 ],
             },
@@ -390,7 +461,7 @@ def send_to_feishu(trends: list[dict], dry_run: bool = False) -> bool:
         if resp.status_code == 200 and (
             body.get("code") == 0 or body.get("StatusCode") == 0
         ):
-            print(f"  Sent {len(matched)} trends to Feishu OK")
+            print(f"  Sent to Feishu OK ({len(highlights)} highlights, {total} total)")
             return True
         print(f"  Feishu error: {resp.status_code} {body}")
         return False
@@ -400,7 +471,6 @@ def send_to_feishu(trends: list[dict], dry_run: bool = False) -> bool:
 
 
 def _traffic_to_num(traffic: str) -> int:
-    """Convert traffic string like '500+' or '2,000+' to a comparable number."""
     s = traffic.replace("+", "").replace(",", "").strip()
     try:
         return int(s)
@@ -412,23 +482,22 @@ def main():
     dry_run = "--dry-run" in sys.argv
 
     print(f"=== Trends Monitor [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ===")
-    print(f"  Region: {GEO}")
+    print(f"  Regions: {', '.join(REGIONS)}")
     print(f"  Dry run: {dry_run}")
 
-    # 1. Fetch trends
-    rss = fetch_rss_trends()
-    print(f"  RSS: {len(rss)} trends")
+    # 1. Fetch from all regions
+    print("  Fetching RSS...")
+    all_raw = fetch_all_regions()
+    total_raw = len(all_raw)
+    print(f"  Total raw: {total_raw}")
 
-    pt = fetch_pytrends_realtime()
-    print(f"  pytrends: {len(pt)} trends")
-
-    # 2. Merge & dedup
-    trends = merge_trends(rss, pt)
-    print(f"  Merged unique: {len(trends)}")
-
-    if not trends:
+    if not all_raw:
         print("  No trends found, aborting.")
         return
+
+    # 2. Cross-region dedup
+    trends = merge_cross_region(all_raw)
+    print(f"  After cross-region dedup: {len(trends)} unique")
 
     # 3. Filter seen
     seen = load_seen_terms()
@@ -443,8 +512,7 @@ def main():
     print("  Classifying with DeepSeek...")
     classified = classify_with_deepseek(new_trends)
 
-    # Print classification summary
-    cat_counts = {}
+    cat_counts: dict[str, int] = {}
     for t in classified:
         c = t.get("category", "other")
         cat_counts[c] = cat_counts.get(c, 0) + 1
@@ -461,9 +529,11 @@ def main():
 
     # Final summary
     matched = [t for t in classified if t.get("category") in TARGET_CATEGORIES]
-    print(f"\n  === Result: {len(matched)} game/meme trends ===")
+    print(f"\n  === Result: {len(matched)} game/meme out of {len(classified)} ===")
     for t in matched:
-        print(f"    [{t.get('category')}] {t['title']} ({t.get('traffic')})")
+        print(
+            f"    [{t.get('category')}] {t['title']} ({t.get('traffic')}) [{t.get('topic')}]"
+        )
     print()
 
 
