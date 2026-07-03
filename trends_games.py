@@ -313,53 +313,67 @@ def send_to_feishu(trends: list[dict], dry_run: bool = False) -> bool:
         return True
 
     matched = [t for t in trends if t.get("category") in TARGET_CATEGORIES]
-
-    if not matched:
-        print("  No game/meme trends to send")
-        return True
+    now_str = datetime.now().strftime("%m-%d %H:%M")
 
     if dry_run:
-        print(f"  [DRY RUN] Would send {len(matched)} items:")
+        print(
+            f"  [DRY RUN] Would send {len(matched)} items"
+            + (" (no hits)" if not matched else "")
+        )
         for t in matched:
             print(f"    [{t.get('category')}] {t['title']} ({t.get('traffic')})")
         return True
 
-    # Sort: game_meme first, then game, then meme
-    priority = {"game_meme": 0, "game": 1, "meme": 2}
-    ordered = sorted(
-        matched,
-        key=lambda x: (
-            priority.get(x.get("category", "other"), 99),
-            -_traffic_to_num(x.get("traffic", "0")),
-        ),
-    )
-
     elements: list[dict] = []
-    for t in ordered:
-        emoji = CATEGORY_EMOJI.get(t.get("category", ""), "")
-        label = CATEGORY_LABEL.get(t.get("category", ""), "")
 
-        # Build a compact info line
-        reason_line = ""
-        if t.get("reason"):
-            reason_line = f"\n{t['reason']}"
+    if matched:
+        # Sort: game_meme first, then game, then meme
+        priority = {"game_meme": 0, "game": 1, "meme": 2}
+        ordered = sorted(
+            matched,
+            key=lambda x: (
+                priority.get(x.get("category", "other"), 99),
+                -_traffic_to_num(x.get("traffic", "0")),
+            ),
+        )
 
-        sources_line = ""
-        if t.get("news_sources"):
-            unique_sources = list(dict.fromkeys(t["news_sources"]))[:3]
-            sources_line = " | " + " · ".join(unique_sources)
+        for t in ordered:
+            emoji = CATEGORY_EMOJI.get(t.get("category", ""), "")
+            label = CATEGORY_LABEL.get(t.get("category", ""), "")
 
+            reason_line = ""
+            if t.get("reason"):
+                reason_line = f"\n{t['reason']}"
+
+            sources_line = ""
+            if t.get("news_sources"):
+                unique_sources = list(dict.fromkeys(t["news_sources"]))[:3]
+                sources_line = " | " + " · ".join(unique_sources)
+
+            elements.append(
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"{emoji} **{t['title']}** `{t.get('traffic', '?')}` {label}{reason_line}{sources_line}",
+                    },
+                }
+            )
+
+        header_title = f"🔥 游戏/Meme 热搜 | {now_str} ({len(matched)}条)"
+        header_template = "turquoise"
+    else:
         elements.append(
             {
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": f"{emoji} **{t['title']}** `{t.get('traffic', '?')}` {label}{reason_line}{sources_line}",
+                    "content": f"本时段 US 热搜 {len(trends)} 条中未发现新的游戏/Meme 热点。\n\n已扫描词数: {len(trends)} | 分类: 全部为非游戏/Meme",
                 },
             }
         )
-
-    now_str = datetime.now().strftime("%m-%d %H:%M")
+        header_title = f"🔍 游戏/Meme 热搜 | {now_str} (无)"
+        header_template = "blue"
 
     payload = {
         "msg_type": "interactive",
@@ -368,9 +382,9 @@ def send_to_feishu(trends: list[dict], dry_run: bool = False) -> bool:
             "header": {
                 "title": {
                     "tag": "plain_text",
-                    "content": f"🔥 游戏/Meme 热搜 | {now_str} ({len(matched)}条)",
+                    "content": header_title,
                 },
-                "template": "turquoise",
+                "template": header_template,
             },
             "elements": elements,
             "note": {
